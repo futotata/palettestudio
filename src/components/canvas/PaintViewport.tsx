@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { clamp, rgbToHex } from '../../color/colorMath';
-import { StrokeSession } from '../../engine/brushEngine';
+import { StrokePoint, StrokeSession } from '../../engine/brushEngine';
 import { buildReferenceImageData, compositeLayers } from '../../engine/compositor';
 import { executeFloodFill } from '../../engine/floodFill';
-import { captureLayersSnapshot } from '../../engine/historyManager';
+import { readCanvasRegion } from '../../engine/gpuReadback';
 import { useCanvasStore } from '../../store/useCanvasStore';
 import { useColorStore } from '../../store/useColorStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -47,7 +47,6 @@ export const PaintViewport: React.FC = () => {
   const fitViewport = useCanvasStore((s) => s.fitViewport);
   const bumpComposite = useCanvasStore((s) => s.bumpComposite);
   const getCurrentStrokeBrush = useCanvasStore((s) => s.getCurrentStrokeBrush);
-  const pushHistoryBeforeChange = useCanvasStore((s) => s.pushHistoryBeforeChange);
   const pushPreCapturedEntry = useCanvasStore((s) => s.pushPreCapturedEntry);
   const undo = useCanvasStore((s) => s.undo);
 
@@ -56,12 +55,20 @@ export const PaintViewport: React.FC = () => {
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cursorRingRef = useRef<HTMLDivElement | null>(null);
+
+  // Cached viewport rect updated via ResizeObserver to eliminate getBoundingClientRect() during strokes
+  const vpRectRef = useRef<{ left: number; top: number; width: number; height: number }>({
+    left: 0,
+    top: 0,
+    width: 1,
+    height: 1,
+  });
 
   const activePointersRef = useRef<Map<number, TouchPointInfo>>(new Map());
   const strokeSessionRef = useRef<{
     pointerId: number;
     session: StrokeSession;
-    preEntry: ReturnType<typeof captureLayersSnapshot>;
     movedDist: number;
     startClientX: number;
     startClientY: number;
@@ -85,19 +92,33 @@ export const PaintViewport: React.FC = () => {
   } | null>(null);
 
   const [eyedropperHud, setEyedropperHud] = useState<EyedropperHud | null>(null);
-  const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const spaceHeldRef = useRef(false);
 
-  // Initial fit to viewport
+  const syncViewportRect = useCallback(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    vpRectRef.current = { left: r.left, top: r.top, width: r.width, height: r.height };
+  }, []);
+
   useEffect(() => {
     const el = viewportRef.current;
     if (!el) return;
-    const rect = el.getBoundingClientRect();
-    fitViewport(rect.width, rect.height);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, height]);
+    syncViewportRect();
+    fitViewport(vpRectRef.current.width, vpRectRef.current.height);
 
-  // Keyboard shortcuts (Undo/Redo, Space pan, X swap colors) for optional tablet keyboard
+    const ro = new ResizeObserver(() => {
+      syncViewportRect();
+    });
+    ro.observe(el);
+    window.addEventListener('resize', syncViewportRect);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', syncViewportRect);
+    };
+  }, [width, height, fitViewport, syncViewportRect]);
+
+  // Keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -127,35 +148,37 @@ export const PaintViewport: React.FC = () => {
     };
   }, []);
 
-  // Re-composite layers onto displayCanvas
+  // Full composite onto GPU-accelerated displayCanvas ONLY when compositeVersion/layers/paper changes
   useEffect(() => {
     const canvas = displayCanvasRef.current;
     if (!canvas) return;
     if (canvas.width !== width) canvas.width = width;
     if (canvas.height !== height) canvas.height = height;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    // IMPORTANT: Never pass { willReadFrequently: true } here so displayCanvas stays on Mali-G57 GPU!
+    const ctx = canvas.getContext('2d');
     if (!ctx) return;
     compositeLayers(ctx, layers, width, height, paperColor);
   }, [layers, width, height, paperColor, compositeVersion]);
 
-  /**
-   * Maps screen client coordinates into document pixel coordinates (0..width, 0..height),
-   * accounting for pan, zoom, rotationDeg, and horizontal mirror preview (`flipViewX`).
-   */
   const clientToCanvas = useCallback(
     (clientX: number, clientY: number): { x: number; y: number } => {
-      const vp = viewportRef.current;
-      if (!vp) return { x: 0, y: 0 };
-      const rect = vp.getBoundingClientRect();
+      const rect = vpRectRef.current;
       const vx = clientX - rect.left - rect.width / 2 - panX;
       const vy = clientY - rect.top - rect.height / 2 - panY;
+
+      if (rotationDeg === 0) {
+        const rx = flipViewX ? -vx : vx;
+        return {
+          x: rx / zoom + width / 2,
+          y: vy / zoom + height / 2,
+        };
+      }
 
       const rad = (-rotationDeg * Math.PI) / 180;
       const cos = Math.cos(rad);
       const sin = Math.sin(rad);
       let rx = vx * cos - vy * sin;
       const ry = vx * sin + vy * cos;
-
       if (flipViewX) rx = -rx;
 
       return {
@@ -166,18 +189,39 @@ export const PaintViewport: React.FC = () => {
     [panX, panY, rotationDeg, flipViewX, zoom, width, height]
   );
 
+  // Move cursor ring directly via GPU CSS transform without triggering React re-renders
+  const updateCursorRingDom = (
+    clientX: number,
+    clientY: number,
+    visible: boolean,
+    diameterScreen: number
+  ) => {
+    const ring = cursorRingRef.current;
+    if (!ring) return;
+    if (!visible) {
+      ring.style.opacity = '0';
+      return;
+    }
+    const r = vpRectRef.current;
+    const d = Math.max(4, diameterScreen);
+    const x = clientX - r.left - d * 0.5;
+    const y = clientY - r.top - d * 0.5;
+    ring.style.width = `${d}px`;
+    ring.style.height = `${d}px`;
+    ring.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+    ring.style.opacity = '1';
+  };
+
   const sampleCompositeColorAt = (clientX: number, clientY: number, prevHex: string) => {
     const canvas = displayCanvasRef.current;
-    const vp = viewportRef.current;
-    if (!canvas || !vp) return;
+    if (!canvas) return;
     const pt = clientToCanvas(clientX, clientY);
     const ix = clamp(Math.floor(pt.x), 0, width - 1);
     const iy = clamp(Math.floor(pt.y), 0, height - 1);
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
-    const px = ctx.getImageData(ix, iy, 1, 1).data;
+    // Read 1x1 pixel via isolated CPU bridge so displayCanvas remains GPU-accelerated
+    const px = readCanvasRegion(canvas, ix, iy, 1, 1).data;
     useColorStore.getState().setColorFromRgba({ r: px[0], g: px[1], b: px[2], a: 1 });
-    const vpRect = vp.getBoundingClientRect();
+    const vpRect = vpRectRef.current;
     setEyedropperHud({
       screenX: clientX - vpRect.left,
       screenY: clientY - vpRect.top,
@@ -189,6 +233,8 @@ export const PaintViewport: React.FC = () => {
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     const vp = viewportRef.current;
     if (!vp) return;
+
+    syncViewportRect();
 
     if (e.pointerType === 'pen') {
       notifyStylusDetected();
@@ -206,16 +252,13 @@ export const PaintViewport: React.FC = () => {
     // Multi-touch (2 fingers): Pan + Pinch Zoom + Rotate + 2-finger Tap Undo
     const touchPointers = [...activePointersRef.current.values()].filter((p) => p.type === 'touch');
     if (touchPointers.length >= 2) {
-      // Cancel any nascent accidental 1-finger stroke before committing
-      if (strokeSessionRef.current && strokeSessionRef.current.movedDist < 10) {
-        const activeLayer = layers.find((l) => l.id === activeLayerId);
-        if (activeLayer) {
-          activeLayer.canvas
-            .getContext('2d')
-            ?.putImageData(strokeSessionRef.current.session.getBeforeSnapshot(), 0, 0);
-          bumpComposite();
-        }
+      if (strokeSessionRef.current && strokeSessionRef.current.movedDist < 12) {
+        const cancelledDirty = strokeSessionRef.current.session.cancelStroke();
         strokeSessionRef.current = null;
+        if (cancelledDirty && displayCanvasRef.current) {
+          const ctx = displayCanvasRef.current.getContext('2d');
+          if (ctx) compositeLayers(ctx, layers, width, height, paperColor, cancelledDirty);
+        }
       }
 
       const [p1, p2] = touchPointers;
@@ -230,13 +273,11 @@ export const PaintViewport: React.FC = () => {
       return;
     }
 
-    // Hardware Palm Rejection: ignore single-finger touch on canvas when Pen-Only mode is active
     const effTool = thumbEyedropperHeld ? 'eyedropper' : activeTool;
     if (penOnlyMode && e.pointerType === 'touch' && effTool !== 'pan') {
       return;
     }
 
-    // Middle mouse or Pan tool or Spacebar -> Pan
     if (e.button === 1 || effTool === 'pan' || spaceHeldRef.current) {
       panDragRef.current = {
         pointerId: e.pointerId,
@@ -248,7 +289,6 @@ export const PaintViewport: React.FC = () => {
       return;
     }
 
-    // Eyedropper (either Eyedropper tool or Left Thumb Hold button!)
     if (effTool === 'eyedropper' || e.altKey) {
       const cur = useColorStore.getState().getActiveColorModel();
       const prevHex = rgbToHex(cur.r, cur.g, cur.b);
@@ -263,12 +303,11 @@ export const PaintViewport: React.FC = () => {
     const activeColor = colorStore.getActiveColorModel();
     const isTransparentColor = colorStore.activeSlot === 'transparent';
 
-    // Bucket Flood Fill
+    // Bucket Flood Fill (returns compact bounding-box patch Undo)
     if (effTool === 'fill') {
       const pt = clientToCanvas(e.clientX, e.clientY);
       if (pt.x < 0 || pt.x >= width || pt.y < 0 || pt.y >= height) return;
 
-      pushHistoryBeforeChange();
       const refData = buildReferenceImageData(
         layers,
         width,
@@ -276,7 +315,8 @@ export const PaintViewport: React.FC = () => {
         fillReferMode,
         activeLayer.id
       );
-      const changed = executeFloodFill(activeLayer.canvas, refData, {
+      const patchEntry = executeFloodFill(activeLayer.canvas, refData, {
+        layerId: activeLayer.id,
         x: pt.x,
         y: pt.y,
         fillColor: {
@@ -290,21 +330,26 @@ export const PaintViewport: React.FC = () => {
         expandPx: fillExpandPx,
         alphaLock: activeLayer.alphaLock,
       });
-      if (changed) {
+      if (patchEntry) {
+        pushPreCapturedEntry(patchEntry);
         colorStore.recordStrokeColorUsed();
         bumpComposite();
       }
       return;
     }
 
-    // Brush or Eraser Stroke
+    // Fast Zero-Readback GPU Stroke Start (< 0.5ms on Helio G99!)
     const brush = getCurrentStrokeBrush();
     const isErase = effTool === 'eraser' || isTransparentColor;
     const displayCanvas = displayCanvasRef.current;
     if (!displayCanvas) return;
 
-    const preEntry = captureLayersSnapshot(layers, activeLayerId);
+    if (e.pointerType === 'pen') {
+      updateCursorRingDom(e.clientX, e.clientY, false, 0);
+    }
+
     const session = new StrokeSession({
+      layerId: activeLayer.id,
       layerCanvas: activeLayer.canvas,
       compositeCanvas: displayCanvas,
       brush,
@@ -314,29 +359,37 @@ export const PaintViewport: React.FC = () => {
     });
 
     const pt = clientToCanvas(e.clientX, e.clientY);
-    const pressure =
-      e.pointerType === 'pen' ? (e.pressure > 0 ? e.pressure : 0.5) : 0.72;
-    session.addPoint({ x: pt.x, y: pt.y, pressure });
+    const pressure = e.pointerType === 'pen' ? (e.pressure > 0 ? e.pressure : 0.5) : 0.72;
+    const dirty = session.addPointsBatch([{ x: pt.x, y: pt.y, pressure }]);
 
     strokeSessionRef.current = {
       pointerId: e.pointerId,
       session,
-      preEntry,
       movedDist: 0,
       startClientX: e.clientX,
       startClientY: e.clientY,
     };
 
-    // Directly re-composite for immediate zero-lag visual feedback
-    const ctx = displayCanvas.getContext('2d');
-    if (ctx) compositeLayers(ctx, layers, width, height, paperColor);
+    if (dirty) {
+      const ctx = displayCanvas.getContext('2d');
+      if (ctx) compositeLayers(ctx, layers, width, height, paperColor, dirty);
+    }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const vp = viewportRef.current;
-    if (vp) {
-      const r = vp.getBoundingClientRect();
-      setCursorPos({ x: e.clientX - r.left, y: e.clientY - r.top });
+    const effTool = thumbEyedropperHeld ? 'eyedropper' : activeTool;
+
+    // Update hover cursor ring directly in DOM (skip while stylus is actively pressing screen)
+    const showRing =
+      (effTool === 'brush' || effTool === 'eraser') &&
+      !(e.pointerType === 'pen' && strokeSessionRef.current !== null);
+    if (showRing) {
+      updateCursorRingDom(
+        e.clientX,
+        e.clientY,
+        true,
+        getCurrentStrokeBrush().size * zoom
+      );
     }
 
     const tracked = activePointersRef.current.get(e.pointerId);
@@ -400,35 +453,52 @@ export const PaintViewport: React.FC = () => {
         Math.hypot(e.clientX - activeStroke.startClientX, e.clientY - activeStroke.startClientY)
       );
 
-      // Process coalesced stylus samples for silky high-refresh curves
       const nativeEvt = e.nativeEvent as PointerEvent;
-      const events =
+      const rawCoalesced =
         typeof nativeEvt.getCoalescedEvents === 'function'
           ? nativeEvt.getCoalescedEvents()
-          : [nativeEvt];
-      const samples = events.length > 0 ? events : [nativeEvt];
+          : null;
+      const samples = rawCoalesced && rawCoalesced.length > 0 ? rawCoalesced : [nativeEvt];
 
-      for (const sample of samples) {
-        const pt = clientToCanvas(sample.clientX, sample.clientY);
-        const pressure =
-          sample.pointerType === 'pen'
-            ? sample.pressure > 0
-              ? sample.pressure
-              : 0.5
-            : 0.72;
-        activeStroke.session.addPoint({ x: pt.x, y: pt.y, pressure });
+      const committedPts: StrokePoint[] = new Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        const pt = clientToCanvas(s.clientX, s.clientY);
+        const pressure = s.pointerType === 'pen' ? (s.pressure > 0 ? s.pressure : 0.5) : 0.72;
+        committedPts[i] = { x: pt.x, y: pt.y, pressure };
       }
 
-      const displayCanvas = displayCanvasRef.current;
-      const ctx = displayCanvas?.getContext('2d');
-      if (ctx) compositeLayers(ctx, layers, width, height, paperColor);
+      // Extract OS stylus predicted points (bridges 90Hz display latency on XPPen Magic Note Pad)
+      const predictedPts: StrokePoint[] = [];
+      if (e.pointerType === 'pen' && typeof nativeEvt.getPredictedEvents === 'function') {
+        const rawPred = nativeEvt.getPredictedEvents();
+        const count = Math.min(2, rawPred.length);
+        const fallbackP = committedPts[committedPts.length - 1].pressure;
+        for (let i = 0; i < count; i++) {
+          const pe = rawPred[i];
+          const pt = clientToCanvas(pe.clientX, pe.clientY);
+          predictedPts.push({
+            x: pt.x,
+            y: pt.y,
+            pressure: pe.pressure > 0 ? pe.pressure : fallbackP,
+          });
+        }
+      }
+
+      const dirtyRect = activeStroke.session.addPointsBatch(committedPts, predictedPts);
+      if (dirtyRect) {
+        const displayCanvas = displayCanvasRef.current;
+        const ctx = displayCanvas?.getContext('2d');
+        if (ctx) {
+          compositeLayers(ctx, layers, width, height, paperColor, dirtyRect);
+        }
+      }
     }
   };
 
   const finishPointer = (e: React.PointerEvent<HTMLDivElement>) => {
     activePointersRef.current.delete(e.pointerId);
 
-    // Check 2-finger quick tap -> Undo!
     if (gestureRef.current && activePointersRef.current.size === 0) {
       const elapsed = performance.now() - gestureRef.current.startedAt;
       if (elapsed < 240 && gestureRef.current.maxMove < 14) {
@@ -448,7 +518,15 @@ export const PaintViewport: React.FC = () => {
     if (strokeSessionRef.current?.pointerId === e.pointerId) {
       const finished = strokeSessionRef.current;
       strokeSessionRef.current = null;
-      pushPreCapturedEntry(finished.preEntry);
+
+      const { finalDirty, patchEntry } = finished.session.finishStroke();
+      if (finalDirty && displayCanvasRef.current) {
+        const ctx = displayCanvasRef.current.getContext('2d');
+        if (ctx) compositeLayers(ctx, layers, width, height, paperColor, finalDirty);
+      }
+      if (patchEntry) {
+        pushPreCapturedEntry(patchEntry);
+      }
       useColorStore.getState().recordStrokeColorUsed();
       bumpComposite();
     }
@@ -459,7 +537,6 @@ export const PaintViewport: React.FC = () => {
   };
 
   const effTool = thumbEyedropperHeld ? 'eyedropper' : activeTool;
-  const brushDiameterScreen = getCurrentStrokeBrush().size * zoom;
 
   return (
     <div
@@ -468,7 +545,7 @@ export const PaintViewport: React.FC = () => {
       onPointerMove={handlePointerMove}
       onPointerUp={finishPointer}
       onPointerCancel={finishPointer}
-      onPointerLeave={() => setCursorPos(null)}
+      onPointerLeave={() => updateCursorRingDom(0, 0, false, 0)}
       onWheel={(e) => {
         e.preventDefault();
         const factor = e.deltaY < 0 ? 1.1 : 0.91;
@@ -489,7 +566,7 @@ export const PaintViewport: React.FC = () => {
               : 'none',
       }}
     >
-      {/* Transformed Document Canvas */}
+      {/* GPU-Promoted Transformed Document Canvas */}
       <div
         style={{
           position: 'absolute',
@@ -497,10 +574,11 @@ export const PaintViewport: React.FC = () => {
           top: '50%',
           width,
           height,
-          transform: `translate(-50%, -50%) translate(${panX}px, ${panY}px) rotate(${rotationDeg}deg) scale(${
+          transform: `translate3d(-50%, -50%, 0) translate3d(${panX}px, ${panY}px, 0) rotate(${rotationDeg}deg) scale(${
             flipViewX ? -zoom : zoom
           }, ${zoom})`,
           transformOrigin: 'center center',
+          willChange: 'transform',
           boxShadow: '0 10px 36px rgba(0, 0, 0, 0.52)',
           pointerEvents: 'none',
         }}
@@ -513,22 +591,23 @@ export const PaintViewport: React.FC = () => {
         />
       </div>
 
-      {/* Brush Size Ring Indicator */}
-      {cursorPos && (effTool === 'brush' || effTool === 'eraser') && (
-        <div
-          style={{
-            position: 'absolute',
-            left: cursorPos.x - brushDiameterScreen / 2,
-            top: cursorPos.y - brushDiameterScreen / 2,
-            width: Math.max(4, brushDiameterScreen),
-            height: Math.max(4, brushDiameterScreen),
-            borderRadius: '50%',
-            border: '1.2px solid rgba(255,255,255,0.85)',
-            boxShadow: '0 0 0 1px rgba(0,0,0,0.6)',
-            pointerEvents: 'none',
-          }}
-        />
-      )}
+      {/* Zero-React-Render Brush Ring (moved via translate3d ref) */}
+      <div
+        ref={cursorRingRef}
+        style={{
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          width: 24,
+          height: 24,
+          opacity: 0,
+          borderRadius: '50%',
+          border: '1.2px solid rgba(255,255,255,0.85)',
+          boxShadow: '0 0 0 1px rgba(0,0,0,0.6)',
+          pointerEvents: 'none',
+          willChange: 'transform',
+        }}
+      />
 
       {/* CSP-style Floating Eyedropper Split Color Ring */}
       {eyedropperHud && (
@@ -569,7 +648,6 @@ export const PaintViewport: React.FC = () => {
         </div>
       )}
 
-      {/* Mirror view indicator badge */}
       {flipViewX && (
         <div
           style={{
@@ -590,7 +668,6 @@ export const PaintViewport: React.FC = () => {
         </div>
       )}
 
-      {/* Floating Sub-View Reference Panel (anchored top-left away from right palette) */}
       <SubViewPanel />
     </div>
   );

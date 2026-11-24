@@ -1,3 +1,5 @@
+import { readCanvasRegion, writeCanvasRegion } from './gpuReadback';
+
 /**
  * CLIP STUDIO PAINT equivalent of [編集] > [輝度を透明度に変換]
  * Converts white (luminance = 1) to fully transparent (alpha = 0),
@@ -27,11 +29,9 @@ export function convertBrightnessToOpacityData(imageData: ImageData): ImageData 
 }
 
 export function convertCanvasBrightnessToOpacity(canvas: HTMLCanvasElement): void {
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return;
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const imgData = readCanvasRegion(canvas, 0, 0, canvas.width, canvas.height);
   convertBrightnessToOpacityData(imgData);
-  ctx.putImageData(imgData, 0, 0);
+  writeCanvasRegion(canvas, imgData, 0, 0);
 }
 
 export type SampleTemplateId = 'sphere-gem-study' | 'character-bust' | 'botanical-ribbon';

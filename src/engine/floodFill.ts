@@ -1,39 +1,40 @@
 import { RGBA, clamp } from '../color/colorMath';
+import { readCanvasRegion, writeCanvasRegion } from './gpuReadback';
+import { LayerPatchHistoryEntry } from './historyManager';
 
 export interface FloodFillOptions {
+  layerId: string;
   x: number;
   y: number;
   fillColor: RGBA;
   isErase?: boolean;
   tolerance: number; // 0..100
-  expandPx: number; // 0..3 (area scaling to prevent white gaps along anti-aliased line art)
+  expandPx: number; // 0..3
   alphaLock?: boolean;
 }
 
 /**
- * Scanline Flood Fill supporting a separate Reference ImageData (e.g. Line Art Reference Layer
- * or All Visible Layers composite) while writing pixels into targetCanvas.
+ * Scanline Flood Fill using isolated GPU readback/writeback bridges
+ * and returning a compact bounding-box LayerPatchHistoryEntry for fast Undo/Redo.
  */
 export function executeFloodFill(
   targetCanvas: HTMLCanvasElement,
   referenceImageData: ImageData | null,
   options: FloodFillOptions
-): boolean {
+): LayerPatchHistoryEntry | null {
   const w = targetCanvas.width;
   const h = targetCanvas.height;
   const startX = Math.floor(options.x);
   const startY = Math.floor(options.y);
 
   if (startX < 0 || startX >= w || startY < 0 || startY >= h) {
-    return false;
+    return null;
   }
 
-  const ctx = targetCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return false;
-
-  const targetImage = ctx.getImageData(0, 0, w, h);
+  const beforeFull = readCanvasRegion(targetCanvas, 0, 0, w, h);
+  const targetImage = new ImageData(new Uint8ClampedArray(beforeFull.data), w, h);
   const targetData = targetImage.data;
-  const refData = referenceImageData ? referenceImageData.data : targetData;
+  const refData = referenceImageData ? referenceImageData.data : beforeFull.data;
 
   const startIdx = (startY * w + startX) * 4;
   const sr = refData[startIdx];
@@ -64,6 +65,10 @@ export function executeFloodFill(
   stack[stackPtr++] = seedPixel;
 
   let filledCount = 0;
+  let minX = startX;
+  let maxX = startX;
+  let minY = startY;
+  let maxY = startY;
 
   while (stackPtr > 0) {
     const p = stack[--stackPtr];
@@ -71,8 +76,11 @@ export function executeFloodFill(
 
     const px = p % w;
     const py = (p - px) / w;
+    if (px < minX) minX = px;
+    if (px > maxX) maxX = px;
+    if (py < minY) minY = py;
+    if (py > maxY) maxY = py;
 
-    // Left
     if (px > 0) {
       const left = p - 1;
       if (mask[left] === 0 && matchesSeed(left)) {
@@ -80,7 +88,6 @@ export function executeFloodFill(
         stack[stackPtr++] = left;
       }
     }
-    // Right
     if (px < w - 1) {
       const right = p + 1;
       if (mask[right] === 0 && matchesSeed(right)) {
@@ -88,7 +95,6 @@ export function executeFloodFill(
         stack[stackPtr++] = right;
       }
     }
-    // Up
     if (py > 0) {
       const up = p - w;
       if (mask[up] === 0 && matchesSeed(up)) {
@@ -96,7 +102,6 @@ export function executeFloodFill(
         stack[stackPtr++] = up;
       }
     }
-    // Down
     if (py < h - 1) {
       const down = p + w;
       if (mask[down] === 0 && matchesSeed(down)) {
@@ -106,16 +111,22 @@ export function executeFloodFill(
     }
   }
 
-  if (filledCount === 0) return false;
+  if (filledCount === 0) return null;
 
-  // Area scaling (dilation by 1..3 px so fill reaches cleanly beneath anti-aliased line edges)
   let activeMask = mask;
   const expandSteps = clamp(Math.round(options.expandPx), 0, 3);
+  if (expandSteps > 0) {
+    minX = Math.max(0, minX - expandSteps);
+    maxX = Math.min(w - 1, maxX + expandSteps);
+    minY = Math.max(0, minY - expandSteps);
+    maxY = Math.min(h - 1, maxY + expandSteps);
+  }
+
   for (let step = 0; step < expandSteps; step++) {
     const nextMask = new Uint8Array(activeMask);
-    for (let y = 0; y < h; y++) {
+    for (let y = minY; y <= maxY; y++) {
       const rowOffset = y * w;
-      for (let x = 0; x < w; x++) {
+      for (let x = minX; x <= maxX; x++) {
         const idx = rowOffset + x;
         if (activeMask[idx] === 1) continue;
         if (
@@ -136,39 +147,63 @@ export function executeFloodFill(
   const fb = clamp(Math.round(options.fillColor.b), 0, 255);
   const fa = clamp(options.fillColor.a, 0, 1);
 
-  for (let p = 0; p < totalPixels; p++) {
-    if (activeMask[p] === 0) continue;
-    const i = p * 4;
+  for (let y = minY; y <= maxY; y++) {
+    const rowOffset = y * w;
+    for (let x = minX; x <= maxX; x++) {
+      const p = rowOffset + x;
+      if (activeMask[p] === 0) continue;
+      const i = p * 4;
 
-    if (options.isErase) {
-      targetData[i + 3] = 0;
-      continue;
-    }
-
-    const dstA = targetData[i + 3] / 255;
-    if (options.alphaLock && dstA <= 0) {
-      continue;
-    }
-
-    if (options.alphaLock) {
-      // Preserve destination alpha, blend RGB
-      const mix = fa;
-      targetData[i] = Math.round(fr * mix + targetData[i] * (1 - mix));
-      targetData[i + 1] = Math.round(fg * mix + targetData[i + 1] * (1 - mix));
-      targetData[i + 2] = Math.round(fb * mix + targetData[i + 2] * (1 - mix));
-    } else {
-      const outA = fa + dstA * (1 - fa);
-      if (outA <= 1e-5) {
+      if (options.isErase) {
         targetData[i + 3] = 0;
+        continue;
+      }
+
+      const dstA = targetData[i + 3] / 255;
+      if (options.alphaLock && dstA <= 0) {
+        continue;
+      }
+
+      if (options.alphaLock) {
+        const mix = fa;
+        targetData[i] = Math.round(fr * mix + targetData[i] * (1 - mix));
+        targetData[i + 1] = Math.round(fg * mix + targetData[i + 1] * (1 - mix));
+        targetData[i + 2] = Math.round(fb * mix + targetData[i + 2] * (1 - mix));
       } else {
-        targetData[i] = Math.round((fr * fa + targetData[i] * dstA * (1 - fa)) / outA);
-        targetData[i + 1] = Math.round((fg * fa + targetData[i + 1] * dstA * (1 - fa)) / outA);
-        targetData[i + 2] = Math.round((fb * fa + targetData[i + 2] * dstA * (1 - fa)) / outA);
-        targetData[i + 3] = Math.round(outA * 255);
+        const outA = fa + dstA * (1 - fa);
+        if (outA <= 1e-5) {
+          targetData[i + 3] = 0;
+        } else {
+          targetData[i] = Math.round((fr * fa + targetData[i] * dstA * (1 - fa)) / outA);
+          targetData[i + 1] = Math.round((fg * fa + targetData[i + 1] * dstA * (1 - fa)) / outA);
+          targetData[i + 2] = Math.round((fb * fa + targetData[i + 2] * dstA * (1 - fa)) / outA);
+          targetData[i + 3] = Math.round(outA * 255);
+        }
       }
     }
   }
 
-  ctx.putImageData(targetImage, 0, 0);
-  return true;
+  const patchW = maxX - minX + 1;
+  const patchH = maxY - minY + 1;
+  const beforePatch = new ImageData(patchW, patchH);
+  const afterPatch = new ImageData(patchW, patchH);
+
+  for (let py = 0; py < patchH; py++) {
+    const srcStart = ((minY + py) * w + minX) * 4;
+    const srcEnd = srcStart + patchW * 4;
+    const dstStart = py * patchW * 4;
+    beforePatch.data.set(beforeFull.data.subarray(srcStart, srcEnd), dstStart);
+    afterPatch.data.set(targetData.subarray(srcStart, srcEnd), dstStart);
+  }
+
+  writeCanvasRegion(targetCanvas, afterPatch, minX, minY);
+
+  return {
+    kind: 'patch',
+    layerId: options.layerId,
+    x: minX,
+    y: minY,
+    before: beforePatch,
+    after: afterPatch,
+  };
 }

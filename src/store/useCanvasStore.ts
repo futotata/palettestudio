@@ -10,6 +10,8 @@ import {
 import { LayerBlendMode, LayerItem, compositeLayers } from '../engine/compositor';
 import {
   CanvasHistoryEntry,
+  applyPatchRedo,
+  applyPatchUndo,
   captureLayersSnapshot,
   restoreLayersFromSnapshot,
 } from '../engine/historyManager';
@@ -22,7 +24,7 @@ import {
 export type ToolType = 'brush' | 'eraser' | 'fill' | 'eyedropper' | 'pan';
 export type FillReferMode = 'reference' | 'all' | 'active';
 
-const MAX_UNDO_STEPS = 25;
+const MAX_UNDO_STEPS = 40;
 
 function createBlankCanvas(width: number, height: number): HTMLCanvasElement {
   const c = document.createElement('canvas');
@@ -302,8 +304,16 @@ export const useCanvasStore = create<CanvasStoreState>((set, get) => {
     undo: () =>
       set((s) => {
         if (s.past.length === 0) return {};
-        const currentSnap = captureLayersSnapshot(s.layers, s.activeLayerId);
         const prevEntry = s.past[s.past.length - 1];
+        if (prevEntry.kind === 'patch') {
+          applyPatchUndo(s.layers, prevEntry);
+          return {
+            past: s.past.slice(0, -1),
+            future: [prevEntry, ...s.future].slice(0, MAX_UNDO_STEPS),
+            compositeVersion: s.compositeVersion + 1,
+          };
+        }
+        const currentSnap = captureLayersSnapshot(s.layers, s.activeLayerId);
         const restored = restoreLayersFromSnapshot(prevEntry, s.width, s.height);
         return {
           layers: restored.layers,
@@ -317,8 +327,16 @@ export const useCanvasStore = create<CanvasStoreState>((set, get) => {
     redo: () =>
       set((s) => {
         if (s.future.length === 0) return {};
-        const currentSnap = captureLayersSnapshot(s.layers, s.activeLayerId);
         const nextEntry = s.future[0];
+        if (nextEntry.kind === 'patch') {
+          applyPatchRedo(s.layers, nextEntry);
+          return {
+            past: [...s.past, nextEntry].slice(-MAX_UNDO_STEPS),
+            future: s.future.slice(1),
+            compositeVersion: s.compositeVersion + 1,
+          };
+        }
+        const currentSnap = captureLayersSnapshot(s.layers, s.activeLayerId);
         const restored = restoreLayersFromSnapshot(nextEntry, s.width, s.height);
         return {
           layers: restored.layers,
